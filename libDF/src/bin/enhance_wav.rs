@@ -1,4 +1,9 @@
-use std::{path::PathBuf, process::exit, time::Instant};
+use std::{
+    io::{self, BufReader, BufWriter, Read, Write},
+    path::PathBuf,
+    process::exit,
+    time::Instant,
+};
 
 use anyhow::Result;
 use clap::{Parser, ValueHint};
@@ -75,6 +80,13 @@ struct Args {
     // Audio files
     #[arg(required = true)]
     files: Vec<PathBuf>,
+    /// Use stdin for input and stdout for output
+    #[arg(short = 's', long)]
+    use_stdio: bool,
+
+    /// Buffer size for stdin/stdout operations (in samples)
+    #[arg(long, default_value_t = 8192)]
+    buffer_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -133,16 +145,105 @@ fn main() -> Result<()> {
     let mut sr = model.sr;
     let mut delay = model.fft_size - model.hop_size; // STFT delay
     delay += model.lookahead * model.hop_size; // Add model latency due to lookahead
+
+    if args.use_stdio {
+        process_stdin_stdout(&args, &mut model, sr, delay)?;
+    } else {
+        process_files(&args, &mut model, sr, delay, r_params, df_params)?;
+    }
+
+    Ok(())
+}
+
+fn process_stdin_stdout(args: &Args, model: &mut DfTract, sr: usize, delay: usize) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = BufWriter::new(stdout.lock());
+
+    let mut buffer = vec![0u8; args.buffer_size * 4]; // 4 bytes per f32
+    let mut output_buffer = vec![0f32; args.buffer_size];
+
+    let mut accumulated = Vec::new();
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let samples = bytes_read / 4;
+        let mut input: Vec<f32> = vec![0.0; samples];
+        for i in 0..samples {
+            input[i] = f32::from_le_bytes(buffer[i * 4..(i + 1) * 4].try_into().unwrap());
+        }
+
+        accumulated.extend_from_slice(&input);
+
+        while accumulated.len() >= model.hop_size {
+            let chunk_size = model.hop_size;
+            let input_chunk =
+                Array2::from_shape_vec((1, chunk_size), accumulated[..chunk_size].to_vec())?;
+
+            let mut output = Array2::zeros((1, chunk_size));
+            model.process(input_chunk.view(), output.view_mut())?;
+
+            // Write processed audio
+            if args.compensate_delay {
+                if accumulated.len() > delay {
+                    for sample in output.iter() {
+                        writer.write_all(&sample.to_le_bytes())?;
+                    }
+                }
+            } else {
+                for sample in output.iter() {
+                    writer.write_all(&sample.to_le_bytes())?;
+                }
+            }
+
+            accumulated.drain(..chunk_size);
+        }
+    }
+
+    // Process remaining samples
+    if !accumulated.is_empty() {
+        let pad_size = model.hop_size - accumulated.len();
+        accumulated.extend(vec![0.0; pad_size]);
+
+        let input_chunk = Array2::from_shape_vec((1, model.hop_size), accumulated.clone())?;
+        let mut output = Array2::zeros((1, model.hop_size));
+        model.process(input_chunk.view(), output.view_mut())?;
+
+        // Write final chunk
+        if !args.compensate_delay || accumulated.len() > delay {
+            for sample in output.iter() {
+                writer.write_all(&sample.to_le_bytes())?;
+            }
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn process_files(
+    args: &Args,
+    model: &mut DfTract,
+    mut sr: usize,
+    delay: usize,
+    mut r_params: RuntimeParams,
+    df_params: DfParams,
+) -> Result<()> {
     if !args.output_dir.is_dir() {
         log::info!("Creating output directory: {}", args.output_dir.display());
         std::fs::create_dir_all(args.output_dir.clone())?
     }
-    for file in args.files {
+    for file in &args.files {
         let reader = ReadWav::new(file.to_str().unwrap())?;
         // Check if we need to adjust to multiple channels
         if r_params.n_ch != reader.channels {
             r_params.n_ch = reader.channels;
-            model = DfTract::new(df_params.clone(), &r_params)?;
+            *model = DfTract::new(df_params.clone(), &r_params)?;
             sr = model.sr;
         }
         let sample_sr = reader.sr;
@@ -181,6 +282,5 @@ fn main() -> Result<()> {
         }
         write_wav_arr2(enh_file.to_str().unwrap(), enh.view(), sample_sr as u32)?;
     }
-
     Ok(())
 }
